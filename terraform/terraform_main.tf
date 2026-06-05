@@ -35,6 +35,14 @@ variable "project_name" {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DATA SOURCE (Para usar el rol existente de AWS Academy)
+# ══════════════════════════════════════════════════════════════════════════════
+
+data "aws_iam_role" "lab_role" {
+  name = "LabRole"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # KINESIS STREAM
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -56,7 +64,7 @@ resource "aws_kinesis_stream" "broker" {
 # DYNAMODB TABLES
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Tabla 1: Trades filtrados (valor > 1000 o ventas agresivas)
+# Tabla 1: Trades filtrados (Corregido el Tag sin paréntesis)
 resource "aws_dynamodb_table" "tabla_pc4" {
   name           = "tabla-PC4"
   billing_mode   = "PAY_PER_REQUEST"
@@ -80,12 +88,12 @@ resource "aws_dynamodb_table" "tabla_pc4" {
 
   tags = {
     Name        = "tabla-PC4"
-    Description = "Filtered trades (high value or aggressive sells)"
+    Description = "Filtered trades - high value or aggressive sells"
     Environment = var.environment
   }
 }
 
-# Tabla 2: Agregados por símbolo (global + por minuto)
+# Tabla 2: Agregados por símbolo
 resource "aws_dynamodb_table" "storage_add_pc4" {
   name           = "storage-add-PC4"
   billing_mode   = "PAY_PER_REQUEST"
@@ -108,8 +116,8 @@ resource "aws_dynamodb_table" "storage_add_pc4" {
 # ══════════════════════════════════════════════════════════════════════════════
 
 resource "aws_sqs_queue" "dlq_lambda_pc4" {
-  name                      = "dlq-lambda-PC4"
   message_retention_seconds = 1209600  # 14 days
+  name                      = "dlq-lambda-PC4"
 
   tags = {
     Name        = "dlq-lambda-PC4"
@@ -119,115 +127,18 @@ resource "aws_sqs_queue" "dlq_lambda_pc4" {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# IAM ROLE FOR LAMBDA
-# ══════════════════════════════════════════════════════════════════════════════
-
-resource "aws_iam_role" "lambda_role" {
-  name = "lambda-consumer-PC4-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Name        = "lambda-consumer-PC4-role"
-    Environment = var.environment
-  }
-}
-
-# Policy: Kinesis read access
-resource "aws_iam_role_policy" "lambda_kinesis_policy" {
-  name = "lambda-kinesis-policy"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "kinesis:GetRecords",
-          "kinesis:GetShardIterator",
-          "kinesis:DescribeStream",
-          "kinesis:ListShards",
-          "kinesis:ListStreams"
-        ]
-        Resource = aws_kinesis_stream.broker.arn
-      }
-    ]
-  })
-}
-
-# Policy: DynamoDB write access
-resource "aws_iam_role_policy" "lambda_dynamodb_policy" {
-  name = "lambda-dynamodb-policy"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:GetItem"
-        ]
-        Resource = [
-          aws_dynamodb_table.tabla_pc4.arn,
-          aws_dynamodb_table.storage_add_pc4.arn
-        ]
-      }
-    ]
-  })
-}
-
-# Policy: SQS send access (for error queue)
-resource "aws_iam_role_policy" "lambda_sqs_policy" {
-  name = "lambda-sqs-policy"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "sqs:SendMessage"
-        ]
-        Resource = aws_sqs_queue.dlq_lambda_pc4.arn
-      }
-    ]
-  })
-}
-
-# Policy: CloudWatch Logs
-resource "aws_iam_role_policy_attachment" "lambda_logs_policy" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAMBDA FUNCTION (placeholder - deploy manually or via ZIP)
+# LAMBDA FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 resource "aws_lambda_function" "consumer_pc4" {
-  filename      = "lambda_placeholder.zip"
-  function_name = "consumer-PC4"
-  role          = aws_iam_role.lambda_role.arn
-  handler       = "index.lambda_handler"
-  runtime       = "python3.11"
-  timeout       = 60
-  memory_size   = 256
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  function_name    = "consumer-PC4"
+  role             = data.aws_iam_role.lab_role.arn
+  handler          = "index.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 60
+  memory_size      = 256
 
   environment {
     variables = {
@@ -235,12 +146,6 @@ resource "aws_lambda_function" "consumer_pc4" {
       DLQ_QUEUE_URL       = aws_sqs_queue.dlq_lambda_pc4.url
     }
   }
-
-  depends_on = [
-    aws_iam_role_policy.lambda_kinesis_policy,
-    aws_iam_role_policy.lambda_dynamodb_policy,
-    aws_iam_role_policy.lambda_sqs_policy
-  ]
 
   tags = {
     Name        = "consumer-PC4"
@@ -253,18 +158,19 @@ resource "aws_lambda_function" "consumer_pc4" {
 # ══════════════════════════════════════════════════════════════════════════════
 
 resource "aws_lambda_event_source_mapping" "kinesis_to_lambda" {
-  event_source_arn  = aws_kinesis_stream.broker.arn
-  function_name     = aws_lambda_function.consumer_pc4.arn
-  enabled           = true
-  batch_size        = 100
-  starting_position = "LATEST"
+  event_source_arn                   = aws_kinesis_stream.broker.arn
+  function_name                      = aws_lambda_function.consumer_pc4.arn
+  enabled                            = true
+  batch_size                         = 100
+  starting_position                  = "LATEST"
   maximum_batching_window_in_seconds = 5
 
   function_response_types = ["ReportBatchItemFailures"]
 
-  # Send failed batches to DLQ
-  on_failure {
-    destination_arn = aws_sqs_queue.dlq_lambda_pc4.arn
+  destination_config {
+    on_failure {
+      destination_arn = aws_sqs_queue.dlq_lambda_pc4.arn
+    }
   }
 }
 
@@ -304,5 +210,11 @@ output "lambda_function_name" {
 
 output "lambda_role_arn" {
   description = "IAM role for Lambda"
-  value       = aws_iam_role.lambda_role.arn
+  value       = data.aws_iam_role.lab_role.arn
+}
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "${path.module}/../lambda/practica_consumer_kinesis.py"
+  output_path = "${path.module}/lambda_consumer.zip"
 }
