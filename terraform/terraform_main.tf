@@ -1,5 +1,27 @@
+# ============================================================
+# PC4: Crypto Trading Pipeline - Infraestructura Completa
+# ============================================================
+#
+# Este Terraform despliega TODA la arquitectura:
+#   - Kinesis Stream (broker-PC4)
+#   - DynamoDB (tabla-PC4 + storage-add-PC4)
+#   - Lambda Consumer (consumer-PC4)
+#   - Lambda Event Processor (event-processor-PC4)
+#   - SQS DLQ (dlq-lambda-PC4)
+#   - SNS Topic (crypto-trading-alerts)
+#   - EventBridge Schedule (large-trade-alert)
+#   - IAM Roles y Policies
+#
+# Uso:
+#   cd terraform/
+#   terraform init
+#   terraform apply
+#
+# Para más detalles sobre el despliegue y la arquitectura,
+# consultar el README.md del repositorio.
+# ============================================================
+
 terraform {
-  required_version = ">= 1.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -12,64 +34,52 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # VARIABLES
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 variable "aws_region" {
-  description = "AWS region"
+  default = "us-east-1"
+}
+
+variable "alert_email" {
+  description = "Email para recibir alertas SNS"
   type        = string
-  default     = "us-east-1"
 }
 
-variable "environment" {
-  description = "Environment name"
+variable "lab_role_arn" {
+  description = "ARN del LabRole (si usas cuenta de laboratorio)"
   type        = string
-  default     = "dev"
+  default     = ""
 }
 
-variable "project_name" {
-  description = "Project name"
-  type        = string
-  default     = "crypto-pipeline"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA SOURCE (Para usar el rol existente de AWS Academy)
-# ══════════════════════════════════════════════════════════════════════════════
-
-data "aws_iam_role" "lab_role" {
-  name = "LabRole"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# KINESIS STREAM
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# CAPA 1: INGESTA — Kinesis Stream
+# ============================================================
 
 resource "aws_kinesis_stream" "broker" {
   name             = "broker-PC4"
-  retention_period = 24
-
   stream_mode_details {
     stream_mode = "ON_DEMAND"
   }
+  retention_period = 24
 
   tags = {
-    Name        = "broker-PC4"
-    Environment = var.environment
+    Project = "PC4"
+    Layer   = "Ingesta"
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DYNAMODB TABLES
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# CAPA 2: ALMACENAMIENTO — DynamoDB
+# ============================================================
 
-# Tabla 1: Trades filtrados (Corregido el Tag sin paréntesis)
+# Tabla de trades filtrados (> $500)
 resource "aws_dynamodb_table" "tabla_pc4" {
-  name           = "tabla-PC4"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "symbol"
-  range_key      = "exchange_ts"
+  name         = "tabla-PC4"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "symbol"
+  range_key    = "exchange_ts"
 
   attribute {
     name = "symbol"
@@ -81,23 +91,18 @@ resource "aws_dynamodb_table" "tabla_pc4" {
     type = "S"
   }
 
-  ttl {
-    attribute_name = "ttl"
-    enabled        = false
-  }
-
   tags = {
-    Name        = "tabla-PC4"
-    Description = "Filtered trades - high value or aggressive sells"
-    Environment = var.environment
+    Project = "PC4"
+    Layer   = "Almacenamiento"
+    Tipo    = "Trades-Filtrados"
   }
 }
 
-# Tabla 2: Agregados por símbolo
+# Tabla de agregados (globales + por minuto)
 resource "aws_dynamodb_table" "storage_add_pc4" {
-  name           = "storage-add-PC4"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "symbol"
+  name         = "storage-add-PC4"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "symbol"
 
   attribute {
     name = "symbol"
@@ -105,116 +110,266 @@ resource "aws_dynamodb_table" "storage_add_pc4" {
   }
 
   tags = {
-    Name        = "storage-add-PC4"
-    Description = "Aggregated trades by symbol and time window"
-    Environment = var.environment
+    Project = "PC4"
+    Layer   = "Almacenamiento"
+    Tipo    = "Agregados"
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SQS QUEUE (Dead Letter Queue)
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# CAPA 2: ERRORES — SQS Dead Letter Queue
+# ============================================================
 
-resource "aws_sqs_queue" "dlq_lambda_pc4" {
-  message_retention_seconds = 1209600  # 14 days
-  name                      = "dlq-lambda-PC4"
+resource "aws_sqs_queue" "dlq" {
+  name                       = "dlq-lambda-PC4"
+  message_retention_seconds  = 1209600  # 14 días
+  visibility_timeout_seconds = 30
 
   tags = {
-    Name        = "dlq-lambda-PC4"
-    Description = "Dead Letter Queue for Lambda errors"
-    Environment = var.environment
+    Project = "PC4"
+    Layer   = "Errores"
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LAMBDA FUNCTION
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# CAPA 3: ALERTAS — SNS Topic
+# ============================================================
 
-resource "aws_lambda_function" "consumer_pc4" {
-  filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+resource "aws_sns_topic" "alerts" {
+  name = "crypto-trading-alerts"
+
+  tags = {
+    Project = "PC4"
+    Layer   = "Alertas"
+  }
+}
+
+resource "aws_sns_topic_subscription" "email" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# ============================================================
+# IAM — Roles y Policies
+# ============================================================
+
+# Rol para Lambda Consumer
+resource "aws_iam_role" "lambda_consumer_role" {
+  count = var.lab_role_arn == "" ? 1 : 0
+  name  = "lambda-consumer-PC4-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_consumer_policy" {
+  count = var.lab_role_arn == "" ? 1 : 0
+  name  = "lambda-consumer-PC4-policy"
+  role  = aws_iam_role.lambda_consumer_role[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:ListStreams", "kinesis:ListShards"]
+        Resource = aws_kinesis_stream.broker.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.tabla_pc4.arn, aws_dynamodb_table.storage_add_pc4.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.dlq.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:${var.aws_region}:*:*"
+      }
+    ]
+  })
+}
+
+# Rol para Lambda Event Processor
+resource "aws_iam_role" "lambda_event_processor_role" {
+  count = var.lab_role_arn == "" ? 1 : 0
+  name  = "lambda-event-processor-PC4-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_event_processor_policy" {
+  count = var.lab_role_arn == "" ? 1 : 0
+  name  = "lambda-event-processor-PC4-policy"
+  role  = aws_iam_role.lambda_event_processor_role[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:Scan", "dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.storage_add_pc4.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = aws_sns_topic.alerts.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:${var.aws_region}:*:*"
+      }
+    ]
+  })
+}
+
+# ============================================================
+# LAMBDA 1: Consumer (Kinesis → DynamoDB + SQS)
+# ============================================================
+
+data "archive_file" "consumer_zip" {
+  type        = "zip"
+  source_file = "${path.module}/../lambda/consumer.py"
+  output_path = "${path.module}/consumer.zip"
+}
+
+resource "aws_lambda_function" "consumer" {
   function_name    = "consumer-PC4"
-  role             = data.aws_iam_role.lab_role.arn
-  handler          = "index.lambda_handler"
+  filename         = data.archive_file.consumer_zip.output_path
+  source_code_hash = data.archive_file.consumer_zip.output_base64sha256
+  handler          = "consumer.lambda_handler"
   runtime          = "python3.11"
   timeout          = 60
-  memory_size      = 256
+  memory_size      = 128
 
-  environment {
-    variables = {
-      KINESIS_STREAM_NAME = aws_kinesis_stream.broker.name
-      DLQ_QUEUE_URL       = aws_sqs_queue.dlq_lambda_pc4.url
-    }
-  }
+  role = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_consumer_role[0].arn
 
   tags = {
-    Name        = "consumer-PC4"
-    Environment = var.environment
+    Project = "PC4"
+    Layer   = "Procesamiento"
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EVENT SOURCE MAPPING (Kinesis → Lambda)
-# ══════════════════════════════════════════════════════════════════════════════
-
-resource "aws_lambda_event_source_mapping" "kinesis_to_lambda" {
+# Trigger: Kinesis → Lambda Consumer
+resource "aws_lambda_event_source_mapping" "kinesis_to_consumer" {
   event_source_arn                   = aws_kinesis_stream.broker.arn
-  function_name                      = aws_lambda_function.consumer_pc4.arn
+  function_name                      = aws_lambda_function.consumer.function_name
   enabled                            = true
-  batch_size                         = 100
+  batch_size                         = 1
+  maximum_batching_window_in_seconds = 0
   starting_position                  = "LATEST"
-  maximum_batching_window_in_seconds = 5
-
-  function_response_types = ["ReportBatchItemFailures"]
+  function_response_types            = ["ReportBatchItemFailures"]
 
   destination_config {
     on_failure {
-      destination_arn = aws_sqs_queue.dlq_lambda_pc4.arn
+      destination_arn = aws_sqs_queue.dlq.arn
     }
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# LAMBDA 2: Event Processor (EventBridge → SNS)
+# ============================================================
+
+data "archive_file" "event_processor_zip" {
+  type        = "zip"
+  source_file = "${path.module}/../lambda/event_processor.py"
+  output_path = "${path.module}/event_processor.zip"
+}
+
+resource "aws_lambda_function" "event_processor" {
+  function_name    = "event-processor-PC4"
+  filename         = data.archive_file.event_processor_zip.output_path
+  source_code_hash = data.archive_file.event_processor_zip.output_base64sha256
+  handler          = "event_processor.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 30
+  memory_size      = 128
+
+  role = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_event_processor_role[0].arn
+
+  tags = {
+    Project = "PC4"
+    Layer   = "Alertas"
+  }
+}
+
+# ============================================================
+# EVENTBRIDGE — Schedule (cada 5 minutos)
+# ============================================================
+
+resource "aws_scheduler_schedule" "large_trade_alert" {
+  name        = "large-trade-alert"
+  description = "Revisa agregados cada 5 minutos y alerta si value_usd > $3.000"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression = "rate(5 minutes)"
+
+  target {
+    arn      = aws_lambda_function.event_processor.arn
+    role_arn = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_event_processor_role[0].arn
+  }
+}
+
+# Permiso para que EventBridge invoque Lambda
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.event_processor.function_name
+  principal     = "scheduler.amazonaws.com"
+}
+
+# ============================================================
 # OUTPUTS
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 output "kinesis_stream_name" {
-  description = "Kinesis stream name"
-  value       = aws_kinesis_stream.broker.name
+  value = aws_kinesis_stream.broker.name
 }
 
-output "kinesis_stream_arn" {
-  description = "Kinesis stream ARN"
-  value       = aws_kinesis_stream.broker.arn
+output "dynamodb_tabla_pc4" {
+  value = aws_dynamodb_table.tabla_pc4.name
 }
 
-output "dynamodb_tabla_pc4_name" {
-  description = "DynamoDB table for filtered trades"
-  value       = aws_dynamodb_table.tabla_pc4.name
-}
-
-output "dynamodb_storage_add_pc4_name" {
-  description = "DynamoDB table for aggregates"
-  value       = aws_dynamodb_table.storage_add_pc4.name
+output "dynamodb_storage_add_pc4" {
+  value = aws_dynamodb_table.storage_add_pc4.name
 }
 
 output "sqs_dlq_url" {
-  description = "SQS Dead Letter Queue URL"
-  value       = aws_sqs_queue.dlq_lambda_pc4.url
+  value = aws_sqs_queue.dlq.url
 }
 
-output "lambda_function_name" {
-  description = "Lambda function name"
-  value       = aws_lambda_function.consumer_pc4.function_name
+output "sns_topic_arn" {
+  value = aws_sns_topic.alerts.arn
 }
 
-output "lambda_role_arn" {
-  description = "IAM role for Lambda"
-  value       = data.aws_iam_role.lab_role.arn
+output "lambda_consumer" {
+  value = aws_lambda_function.consumer.function_name
 }
 
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_file = "${path.module}/../lambda/practica_consumer_kinesis.py"
-  output_path = "${path.module}/lambda_consumer.zip"
+output "lambda_event_processor" {
+  value = aws_lambda_function.event_processor.function_name
 }

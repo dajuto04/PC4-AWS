@@ -12,7 +12,7 @@ import websocket  # pip install websocket-client
 STREAM_NAME = "broker-PC4"
 REGION = "us-east-1"
 
-SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD"]
+SYMBOLS = ["BTC-USD"]
 
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
