@@ -1,25 +1,6 @@
 # ============================================================
 # PC4: Crypto Trading Pipeline - Infraestructura Completa
 # ============================================================
-#
-# Este Terraform despliega TODA la arquitectura:
-#   - Kinesis Stream (broker-PC4)
-#   - DynamoDB (tabla-PC4 + storage-add-PC4)
-#   - Lambda Consumer (consumer-PC4)
-#   - Lambda Event Processor (event-processor-PC4)
-#   - SQS DLQ (dlq-lambda-PC4)
-#   - SNS Topic (crypto-trading-alerts)
-#   - EventBridge Schedule (large-trade-alert)
-#   - IAM Roles y Policies
-#
-# Uso:
-#   cd terraform/
-#   terraform init
-#   terraform apply
-#
-# Para más detalles sobre el despliegue y la arquitectura,
-# consultar el README.md del repositorio.
-# ============================================================
 
 terraform {
   required_providers {
@@ -47,10 +28,12 @@ variable "alert_email" {
   type        = string
 }
 
-variable "lab_role_arn" {
-  description = "ARN del LabRole (si usas cuenta de laboratorio)"
-  type        = string
-  default     = ""
+# ============================================================
+# DATA SOURCE (Para usar el rol existente de AWS Academy)
+# ============================================================
+
+data "aws_iam_role" "lab_role" {
+  name = "LabRole"
 }
 
 # ============================================================
@@ -151,99 +134,6 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 # ============================================================
-# IAM — Roles y Policies
-# ============================================================
-
-# Rol para Lambda Consumer
-resource "aws_iam_role" "lambda_consumer_role" {
-  count = var.lab_role_arn == "" ? 1 : 0
-  name  = "lambda-consumer-PC4-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "lambda.amazonaws.com" }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "lambda_consumer_policy" {
-  count = var.lab_role_arn == "" ? 1 : 0
-  name  = "lambda-consumer-PC4-policy"
-  role  = aws_iam_role.lambda_consumer_role[0].id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:ListStreams", "kinesis:ListShards"]
-        Resource = aws_kinesis_stream.broker.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"]
-        Resource = [aws_dynamodb_table.tabla_pc4.arn, aws_dynamodb_table.storage_add_pc4.arn]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["sqs:SendMessage"]
-        Resource = aws_sqs_queue.dlq.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:${var.aws_region}:*:*"
-      }
-    ]
-  })
-}
-
-# Rol para Lambda Event Processor
-resource "aws_iam_role" "lambda_event_processor_role" {
-  count = var.lab_role_arn == "" ? 1 : 0
-  name  = "lambda-event-processor-PC4-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "lambda.amazonaws.com" }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "lambda_event_processor_policy" {
-  count = var.lab_role_arn == "" ? 1 : 0
-  name  = "lambda-event-processor-PC4-policy"
-  role  = aws_iam_role.lambda_event_processor_role[0].id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["dynamodb:Scan", "dynamodb:GetItem"]
-        Resource = aws_dynamodb_table.storage_add_pc4.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["sns:Publish"]
-        Resource = aws_sns_topic.alerts.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:${var.aws_region}:*:*"
-      }
-    ]
-  })
-}
-
-# ============================================================
 # LAMBDA 1: Consumer (Kinesis → DynamoDB + SQS)
 # ============================================================
 
@@ -261,8 +151,7 @@ resource "aws_lambda_function" "consumer" {
   runtime          = "python3.11"
   timeout          = 60
   memory_size      = 128
-
-  role = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_consumer_role[0].arn
+  role             = data.aws_iam_role.lab_role.arn # Usando LabRole directo
 
   tags = {
     Project = "PC4"
@@ -305,8 +194,7 @@ resource "aws_lambda_function" "event_processor" {
   runtime          = "python3.11"
   timeout          = 30
   memory_size      = 128
-
-  role = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_event_processor_role[0].arn
+  role             = data.aws_iam_role.lab_role.arn # Usando LabRole directo
 
   tags = {
     Project = "PC4"
@@ -330,7 +218,7 @@ resource "aws_scheduler_schedule" "large_trade_alert" {
 
   target {
     arn      = aws_lambda_function.event_processor.arn
-    role_arn = var.lab_role_arn != "" ? var.lab_role_arn : aws_iam_role.lambda_event_processor_role[0].arn
+    role_arn = data.aws_iam_role.lab_role.arn # Usando LabRole directo
   }
 }
 
