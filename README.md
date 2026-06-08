@@ -12,34 +12,36 @@ Ingesta datos reales de Coinbase WebSocket, los procesa asíncronamente con Lamb
 
 ## Arquitectura
 
-```
-Coinbase WebSocket (datos reales BTC-USD)
-        │
-        ▼
-Producer (producer.py) ── Throttle 5s ── Transforma JSON
-        │
-        ▼
-Kinesis Stream (broker-PC4) ── ON_DEMAND, particionado por símbolo
-        │
-        ▼
-Lambda Consumer (consumer-PC4) ── Batch 1, near-real-time
-        │
-        ├──▶ tabla-PC4 (DynamoDB) ── Trades filtrados > $500
-        │
-        ├──▶ storage-add-PC4 (DynamoDB) ── Agregados globales + por minuto
-        │
-        └──▶ SQS DLQ (dlq-lambda-PC4) ── Errores individuales + batches fallidos
+```mermaid
+graph TD
+    %% Entidades Externas
+    A[Coinbase WebSocket<br>BTC-USD] -->|Trades en vivo| B(Producer: producer.py)
+    
+    %% Ingesta
+    B -->|Throttle 5s + JSON| C[Kinesis Stream<br>broker-PC4]
+    
+    %% Procesamiento y Almacenamiento
+    C -->|Batch 1| D(Lambda: consumer-PC4)
+    D -->|Trades > $500| E[(DynamoDB: tabla-PC4)]
+    D -->|Agregados Global/Minuto| F[(DynamoDB: storage-add-PC4)]
+    
+    %% Manejo de Errores
+    D -.->|Errores / Fallos| G[SQS DLQ: dlq-lambda-PC4]
 
-EventBridge Schedule (cada 5 min)
-        │
-        ▼
-Lambda Event-Processor (event-processor-PC4)
-        │
-        ▼
-SNS Topic (crypto-trading-alerts) ── value_usd > $3.000
-        │
-        ▼
-EMAIL 📧
+    %% Alertas (Event-Driven)
+    H((EventBridge Schedule<br>Cada 5 min)) --> I(Lambda: event-processor-PC4)
+    F -.->|Scan| I
+    I -->|value_usd > $3,000| J[SNS Topic: crypto-trading-alerts]
+    J -->|Notificación| K[📧 Email]
+
+    %% Estilos básicos
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:black;
+    classDef lambda fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:black,rx:10;
+    classDef db fill:#3B48CC,stroke:#232F3E,stroke-width:2px,color:white;
+    
+    class C,G,J aws;
+    class D,I lambda;
+    class E,F db;
 ```
 
 ---
